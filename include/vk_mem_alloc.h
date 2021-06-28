@@ -7241,6 +7241,8 @@ private:
 #endif
 };
 
+struct VmaBlockVector;
+
 /*
 Represents a single block of device memory (`VkDeviceMemory`) with all the
 data about its regions (aka suballocations, #VmaAllocation), assigned and free.
@@ -7264,6 +7266,7 @@ public:
     // Always call after construction.
     void Init(
         VmaAllocator hAllocator,
+        VmaBlockVector* parentBlockVector,
         VmaPool hParentPool,
         uint32_t newMemoryTypeIndex,
         VkDeviceMemory newMemory,
@@ -7273,6 +7276,7 @@ public:
     // Always call before destruction.
     void Destroy(VmaAllocator allocator);
 
+    VmaBlockVector* GetParentBlockVector() const { return m_ParentBlockVector; }
     VmaPool GetParentPool() const { return m_hParentPool; }
     VkDeviceMemory GetDeviceMemory() const { return m_hMemory; }
     uint32_t GetMemoryTypeIndex() const { return m_MemoryTypeIndex; }
@@ -7305,10 +7309,11 @@ public:
         const void* pNext);
 
 private:
-    VmaPool m_hParentPool; // VK_NULL_HANDLE if not belongs to custom pool.
-    uint32_t m_MemoryTypeIndex;
-    uint32_t m_Id;
-    VkDeviceMemory m_hMemory;
+    VmaBlockVector* m_ParentBlockVector = VMA_NULL;
+    VmaPool m_hParentPool = VK_NULL_HANDLE; // VK_NULL_HANDLE if not belongs to custom pool.
+    uint32_t m_MemoryTypeIndex = UINT32_MAX;
+    uint32_t m_Id = 0;
+    VkDeviceMemory m_hMemory = VK_NULL_HANDLE;
 
     /*
     Protects access to m_hMemory so it's not used by multiple threads simultaneously, e.g. vkMapMemory, vkBindBufferMemory.
@@ -7316,8 +7321,8 @@ private:
     Allocations, deallocations, any change in m_pMetadata is protected by parent's VmaBlockVector::m_Mutex.
     */
     VMA_MUTEX m_Mutex;
-    uint32_t m_MapCount;
-    void* m_pMappedData;
+    uint32_t m_MapCount = 0;
+    void* m_pMappedData = VMA_NULL;
 };
 
 struct VmaDefragmentationMove
@@ -8214,6 +8219,7 @@ public:
 
     // Default pools.
     VmaBlockVector* m_pBlockVectors[VK_MAX_MEMORY_TYPES];
+    VmaBlockVector* m_pSmallBufferBlockVectors[VK_MAX_MEMORY_TYPES];
 
     typedef VmaIntrusiveLinkedList<VmaDedicatedAllocationListItemTraits> DedicatedAllocationLinkedList;
     DedicatedAllocationLinkedList m_DedicatedAllocations[VK_MAX_MEMORY_TYPES];
@@ -12626,18 +12632,13 @@ void VmaBlockMetadata_Buddy::PrintDetailedMapNode(class VmaJsonWriter& json, con
 ////////////////////////////////////////////////////////////////////////////////
 // class VmaDeviceMemoryBlock
 
-VmaDeviceMemoryBlock::VmaDeviceMemoryBlock(VmaAllocator hAllocator) :
-    m_pMetadata(VMA_NULL),
-    m_MemoryTypeIndex(UINT32_MAX),
-    m_Id(0),
-    m_hMemory(VK_NULL_HANDLE),
-    m_MapCount(0),
-    m_pMappedData(VMA_NULL)
+VmaDeviceMemoryBlock::VmaDeviceMemoryBlock(VmaAllocator hAllocator)
 {
 }
 
 void VmaDeviceMemoryBlock::Init(
     VmaAllocator hAllocator,
+    VmaBlockVector* parentBlockVector,
     VmaPool hParentPool,
     uint32_t newMemoryTypeIndex,
     VkDeviceMemory newMemory,
@@ -12645,8 +12646,10 @@ void VmaDeviceMemoryBlock::Init(
     uint32_t id,
     uint32_t algorithm)
 {
+    VMA_ASSERT(parentBlockVector != VMA_NULL);
     VMA_ASSERT(m_hMemory == VK_NULL_HANDLE);
 
+    m_ParentBlockVector = parentBlockVector;
     m_hParentPool = hParentPool;
     m_MemoryTypeIndex = newMemoryTypeIndex;
     m_Id = id;
@@ -13455,6 +13458,8 @@ VkResult VmaBlockVector::AllocatePage(
 void VmaBlockVector::Free(
     const VmaAllocation hAllocation)
 {
+    VMA_ASSERT(hAllocation->GetBlock()->GetParentBlockVector() == this);
+
     VmaDeviceMemoryBlock* pBlockToDelete = VMA_NULL;
 
     bool budgetExceeded = false;
@@ -13677,6 +13682,7 @@ VkResult VmaBlockVector::CreateBlock(VkDeviceSize blockSize, size_t* pNewBlockIn
     VmaDeviceMemoryBlock* const pBlock = vma_new(m_hAllocator, VmaDeviceMemoryBlock)(m_hAllocator);
     pBlock->Init(
         m_hAllocator,
+        this, // parentBlockVector
         m_hParentPool,
         m_MemoryTypeIndex,
         mem,
@@ -16106,6 +16112,7 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
     memset(&m_MemProps, 0, sizeof(m_MemProps));
 
     memset(&m_pBlockVectors, 0, sizeof(m_pBlockVectors));
+    memset(&m_pSmallBufferBlockVectors, 0, sizeof(m_pSmallBufferBlockVectors));
     memset(&m_VulkanFunctions, 0, sizeof(m_VulkanFunctions));
 
 
@@ -16166,6 +16173,20 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
             0.5f, // priority (0.5 is the default per Vulkan spec)
             GetMemoryTypeMinAlignment(memTypeIndex), // minAllocationAlignment
 			VMA_NULL); // // pMemoryAllocateNext
+        m_pSmallBufferBlockVectors[memTypeIndex] = vma_new(this, VmaBlockVector)(
+            this,
+            VK_NULL_HANDLE, // hParentPool
+            memTypeIndex,
+            preferredBlockSize,
+            0,
+            SIZE_MAX,
+            1, // bufferImageGranularity forced to 1 !!!
+            pCreateInfo->frameInUseCount,
+            false, // explicitBlockSize
+            false, // linearAlgorithm
+            0.5f, // priority (0.5 is the default per Vulkan spec)
+            GetMemoryTypeMinAlignment(memTypeIndex), // minAllocationAlignment
+            VMA_NULL); // // pMemoryAllocateNext
         // No need to call m_pBlockVectors[memTypeIndex][blockVectorTypeIndex]->CreateMinBlocks here,
         // becase minBlockCount is 0.
     }
@@ -16229,6 +16250,7 @@ VmaAllocator_T::~VmaAllocator_T()
             VMA_ASSERT(0 && "Unfreed dedicated allocations found.");
         }
 
+        vma_delete(this, m_pSmallBufferBlockVectors[memTypeIndex]);
         vma_delete(this, m_pBlockVectors[memTypeIndex]);
     }
 }
@@ -16484,7 +16506,8 @@ VkResult VmaAllocator_T::AllocateMemoryOfType(
         finalCreateInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     }
 
-    VmaBlockVector* const blockVector = m_pBlockVectors[memTypeIndex];
+    bool isSmallBuffer = dedicatedBuffer != VK_NULL_HANDLE && size <= 4096; // TODO
+    VmaBlockVector* const blockVector = isSmallBuffer ? m_pSmallBufferBlockVectors[memTypeIndex] : m_pBlockVectors[memTypeIndex];
     VMA_ASSERT(blockVector);
 
     const VkDeviceSize preferredBlockSize = blockVector->GetPreferredBlockSize();
@@ -17011,8 +17034,7 @@ void VmaAllocator_T::FreeMemory(
                         }
                         else
                         {
-                            const uint32_t memTypeIndex = allocation->GetMemoryTypeIndex();
-                            pBlockVector = m_pBlockVectors[memTypeIndex];
+                            pBlockVector = allocation->GetBlock()->GetParentBlockVector();
                         }
                         pBlockVector->Free(allocation);
                     }
@@ -17048,6 +17070,10 @@ void VmaAllocator_T::CalculateStats(VmaStats* pStats)
         VmaBlockVector* const pBlockVector = m_pBlockVectors[memTypeIndex];
         VMA_ASSERT(pBlockVector);
         pBlockVector->AddStats(pStats);
+        
+        VmaBlockVector* const pSmallBufferBlockVector = m_pSmallBufferBlockVectors[memTypeIndex];
+        VMA_ASSERT(pSmallBufferBlockVector);
+        pSmallBufferBlockVector->AddStats(pStats);
     }
 
     // Process custom pools.
@@ -18045,6 +18071,7 @@ void VmaAllocator_T::PrintDetailedMap(VmaJsonWriter& json)
         json.EndObject();
     }
 
+    // Default pools
     {
         bool allocationsStarted = false;
         for(uint32_t memTypeIndex = 0; memTypeIndex < GetMemoryTypeCount(); ++memTypeIndex)
@@ -18063,6 +18090,33 @@ void VmaAllocator_T::PrintDetailedMap(VmaJsonWriter& json)
                 json.EndString();
 
                 m_pBlockVectors[memTypeIndex]->PrintDetailedMap(json);
+            }
+        }
+        if(allocationsStarted)
+        {
+            json.EndObject();
+        }
+    }
+
+    // Small buffer pools
+    {
+        bool allocationsStarted = false;
+        for(uint32_t memTypeIndex = 0; memTypeIndex < GetMemoryTypeCount(); ++memTypeIndex)
+        {
+            if(m_pSmallBufferBlockVectors[memTypeIndex]->IsEmpty() == false)
+            {
+                if(allocationsStarted == false)
+                {
+                    allocationsStarted = true;
+                    json.WriteString("SmallBufferPools");
+                    json.BeginObject();
+                }
+
+                json.BeginString("Type ");
+                json.ContinueString(memTypeIndex);
+                json.EndString();
+
+                m_pSmallBufferBlockVectors[memTypeIndex]->PrintDetailedMap(json);
             }
         }
         if(allocationsStarted)
