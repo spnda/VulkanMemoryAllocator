@@ -26,6 +26,11 @@ set_target_properties(
 
 target_include_directories(VulkanMemoryAllocator PUBLIC "${PROJECT_SOURCE_DIR}/include")
 
+if (${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.16.0" AND ${VMA_PRECOMPILE_HEADERS})
+    target_compile_definitions(VulkanMemoryAllocator PRIVATE VMA_IMPLEMENTATION)
+    target_precompile_headers(VulkanMemoryAllocator PUBLIC "${PROJECT_SOURCE_DIR}/include/vk_mem_alloc.h")
+endif()
+
 # Only link to Vulkan if static linking is used
 if(${VMA_STATIC_VULKAN_FUNCTIONS})
     target_link_libraries(VulkanMemoryAllocator PUBLIC Vulkan::Vulkan)
